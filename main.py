@@ -24,15 +24,19 @@ Model, per trophy (all fits on the logit scale, rates clamped to [0.01, 99.99]):
 * Stale page. With a single distinct state the trend and elasticity are
   degenerate, so a dilution prior applies: a just-released game with a tiny
   tracked base multiplies its players several-fold over the horizon
-  (launch night: about 6x), and with alpha ~ 0.3 the median is roughly the
-  last rate times 6**(0.3 - 1) -- about x0.3.
+  (launch night: about 6x), while the earners of any one trophy barely
+  grow (about 1.3x), so with alpha ~ 0.13 the median is roughly the
+  last rate times 6**(0.13 - 1) -- about x0.21. The sum calibration
+  matches only the non-pinned trophies, so the pinned universal
+  trophy's 100 points cannot hide a bias in the rest.
 * Sum calibration. The medians are shifted by one common bounded logit
   shift (|delta| <= ~0.7) so their sum matches 100 * (trophies_earned /
   players) extrapolated on the same log-time axis.
 * Spread. sigma = sqrt((0.55*sqrt(horizon_days))**2 + residual**2 * leverage
-  + 0.35**2), floored at ~0.85 and capped at ~2.2, with a staleness term
-  (sigma up to ~1.15) when the page was static for the whole history, since
-  a refresh is overdue. The universal (100%) trophy is pinned near 99.99.
+  + 0.35**2), floored at ~0.85 and capped at ~2.2, with a staleness floor
+  of ~0.6 when the page was static for the whole history: one refresh
+  moves every trophy's log-rate by a similar, fairly concentrated
+  amount. The universal (100%) trophy is pinned near 99.99.
 
 Only the Python standard library is used. No network, no randomness, no
 wall-clock reads: two runs on the same case write byte-identical output.
@@ -61,7 +65,14 @@ EPOCH = datetime(2026, 11, 19, 0, 0, 0, tzinfo=timezone.utc)
 # Prior player multiplier over the horizon when the page has never moved.
 STALE_PLAYER_MULTIPLIER = 6.0
 # Prior earners elasticity in the stale regime, and the generic prior.
-STALE_ALPHA = 0.30
+# STALE_ALPHA is small on purpose: when Exophase refreshes after a stale
+# page, the tracked base multiplies (launch night: 638 -> 3,868, about 6x)
+# while the earners of any one trophy barely grow -- the newly tracked
+# players are mostly fresh players who have not earned that trophy yet
+# (launch night: non-universal earners grew only ~1.3x). So a stale
+# page's median rate falls by roughly the player multiplier, not by the
+# much smaller dilution a 0.30 elasticity would give.
+STALE_ALPHA = 0.13
 ALPHA_PRIOR = 0.35
 # Blend weights: trend, earners-model, persistence.
 W_TREND, W_EARNERS, W_PERSIST = 0.45, 0.35, 0.20
@@ -72,7 +83,12 @@ SIGMA_RW = 0.55          # random-walk scale per sqrt(day)
 SIGMA_FLOOR = 0.35       # irreducible logit noise
 SIGMA_MIN = 0.85
 SIGMA_MAX = 2.2
-SIGMA_STALE = 1.15       # floor when the page never moved
+SIGMA_STALE = 0.60       # floor when the page never moved: one refresh
+                         # moves every trophy's log-rate by a similar,
+                         # fairly concentrated amount, so the honest
+                         # spread for a single refresh is well under 1
+                         # logit; the random-walk term still widens it
+                         # on long horizons (see the stale branch below)
 TREND_HALF_LIFE_H = 24.0
 TREND_CHANGE_CAP = 2.5
 PLATINUM_MEDIAN_CAP = 3.0
@@ -212,13 +228,31 @@ def forecast_case(case, name):
     else:
         p_star = math.exp(fit_p[0] + fit_p[1] * x_star)
     if stale or fit_t is None:
-        t_star = t_last * (STALE_PLAYER_MULTIPLIER ** 0.85)
+        # Decompose the total: the universal (pinned) trophies' earners
+        # grow with the tracked base itself (every tracked player holds
+        # them), while the other trophies' earners grow only by the
+        # stale elasticity. Extrapolating the aggregate with one
+        # exponent would credit the slow trophies with the pinned
+        # trophies' growth (launch night: aggregate trophies-earned
+        # grew ~4.6x, but the non-universal earners only ~1.3x).
+        t_star = p_star + max(0.0, t_last - p_last) * (
+            STALE_PLAYER_MULTIPLIER ** STALE_ALPHA)
     else:
         t_star = math.exp(fit_t[0] + fit_t[1] * x_star)
     # Players and earned trophies never shrink; cap runaway extrapolation.
     p_star = min(max(p_star, p_last), p_last * 50.0)
     t_star = min(max(t_star, t_last), max(t_last * 50.0, t_last + 1.0))
-    sum_target = 100.0 * t_star / p_star if p_star > 0 else None
+    # The sum calibration below matches only the non-pinned trophies:
+    # a pinned trophy's rate is 100 by construction and would swamp the
+    # sum, hiding a systematic error in the other trophies' medians.
+    n_pinned = 0
+    pinned_idx = set()
+    for i in range(n):
+        if (last_available_rate(history, i) or 0.0) >= 99.99:
+            n_pinned += 1
+            pinned_idx.add(i)
+    sum_target = (100.0 * max(0.0, t_star - n_pinned * p_star) / p_star
+                  if p_star > 0 else None)
 
     # ---- Per-trophy trend slopes (first pass: collect, then shrink). ----
     trend = []  # per trophy: (lg_trend, resid_rms, leverage, lg_last)
@@ -331,10 +365,12 @@ def forecast_case(case, name):
         medians.append(lg_med)
         sigmas.append(sigma)
 
-    # ---- Sum calibration: one bounded common logit shift. ----
+    # ---- Sum calibration: one bounded common logit shift, applied
+    # only to the non-pinned trophies (a pinned trophy stays pinned). ----
     if sum_target is not None and medians:
         def total(delta):
-            return sum(inv_logit(lg + delta) for lg in medians)
+            return sum(inv_logit(lg + delta) for j, lg in enumerate(medians)
+                       if j not in pinned_idx)
         lo, hi = -MAX_SHIFT, MAX_SHIFT
         if total(lo) > sum_target:
             delta = lo
@@ -348,7 +384,8 @@ def forecast_case(case, name):
                 else:
                     hi = mid
             delta = 0.5 * (lo + hi)
-        medians = [lg + delta for lg in medians]
+        medians = [lg + delta if j not in pinned_idx else lg
+                   for j, lg in enumerate(medians)]
 
     rows = []
     for trophy, lg_med, sigma in zip(trophies, medians, sigmas):
