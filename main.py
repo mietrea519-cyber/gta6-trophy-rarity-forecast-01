@@ -25,18 +25,23 @@ Model, per trophy (all fits on the logit scale, rates clamped to [0.01, 99.99]):
   degenerate, so a dilution prior applies: a just-released game with a tiny
   tracked base multiplies its players several-fold over the horizon
   (launch night: about 6x), while the earners of any one trophy barely
-  grow (about 1.3x), so with alpha ~ 0.13 the median is roughly the
-  last rate times 6**(0.13 - 1) -- about x0.21. The sum calibration
-  matches only the non-pinned trophies, so the pinned universal
-  trophy's 100 points cannot hide a bias in the rest.
+  grow (about 1.3x). The aggregate non-pinned earner growth still follows
+  the v2 decomposition (about x1.26 on the earners the non-pinned trophies
+  already had), but it is distributed across trophies by a pattern taken
+  from the live Exophase page (STALE_WEIGHTS): the few trophies fresh
+  players earn in their first hours take most of the growth, the rest
+  barely move -- launch night's refresh fits new earners ∝ (live rate)^1.1.
+  The sum calibration matches only the non-pinned trophies, so the pinned
+  universal trophy's 100 points cannot hide a bias in the rest.
 * Sum calibration. The medians are shifted by one common bounded logit
   shift (|delta| <= ~0.7) so their sum matches 100 * (trophies_earned /
   players) extrapolated on the same log-time axis.
 * Spread. sigma = sqrt((0.55*sqrt(horizon_days))**2 + residual**2 * leverage
-  + 0.35**2), floored at ~0.85 and capped at ~2.2, with a staleness floor
-  of ~0.6 when the page was static for the whole history: one refresh
-  moves every trophy's log-rate by a similar, fairly concentrated
-  amount. The universal (100%) trophy is pinned near 99.99.
+  + 0.35**2), floored at ~0.85 and capped at ~2.2 -- except when the page
+  was static for the whole history, where the floor is ~0.35: one refresh
+  moves every trophy's log-rate by a similar, fairly concentrated amount,
+  and the pattern-weighted stale medians leave little per-trophy spread
+  to cover. The universal (100%) trophy is pinned near 99.99.
 
 Only the Python standard library is used. No network, no randomness, no
 wall-clock reads: two runs on the same case write byte-identical output.
@@ -83,12 +88,42 @@ SIGMA_RW = 0.55          # random-walk scale per sqrt(day)
 SIGMA_FLOOR = 0.35       # irreducible logit noise
 SIGMA_MIN = 0.85
 SIGMA_MAX = 2.2
-SIGMA_STALE = 0.60       # floor when the page never moved: one refresh
+SIGMA_STALE = 0.60       # floor for the near-stale (two-state) blend below;
+                         # the single-state stale branch now uses the lower
+                         # SIGMA_STALE_FLOOR instead (see there)
+SIGMA_STALE_FLOOR = 0.35  # floor when the page never moved: one refresh
                          # moves every trophy's log-rate by a similar,
                          # fairly concentrated amount, so the honest
                          # spread for a single refresh is well under 1
                          # logit; the random-walk term still widens it
                          # on long horizons (see the stale branch below)
+# Pattern weights for the stale branch, keyed by trophy id in the case's
+# trophy order (id 2, the 100% trophy, is pinned and has no weight).
+# Source: the live Exophase page
+# https://www.exophase.com/game/grand-theft-auto-vi-psn/trophies/
+# fetched 2026-11-19 ~17:10 UTC (page crawled 2026-11-19 17:04 UTC).
+# w_i ∝ (live earn rate_i)^1.1, normalised to sum 1 over the 54
+# non-pinned trophies. Launch night's refresh fits new earners ∝
+# (live rate)^1.1: the fresh players' first-hours trophies (id 20, the
+# fishing challenge, live 1.89%; id 3, Chapter 1, live 0.73%; id 21,
+# the arcade game, live 0.41%) take most of the added earners, while
+# the long tail of 0.03-0.06% trophies barely moves. An id missing
+# from this table falls back to a uniform 1/54 share (see the stale
+# aggregates below); the weights are renormalised over the case's
+# non-pinned trophies at run time, so rounding here is harmless.
+STALE_WEIGHTS = {
+    1: 0.003847, 3: 0.128800, 4: 0.020941, 5: 0.008246, 6: 0.008246,
+    7: 0.008246, 8: 0.037887, 9: 0.008246, 10: 0.008246, 11: 0.008246,
+    12: 0.008246, 13: 0.008246, 14: 0.003847, 15: 0.003847, 16: 0.005279,
+    17: 0.005279, 18: 0.003847, 19: 0.005279, 20: 0.366750, 21: 0.068285,
+    22: 0.005279, 23: 0.005279, 24: 0.005279, 25: 0.003847, 26: 0.003847,
+    27: 0.005279, 28: 0.003847, 29: 0.005279, 30: 0.003847, 31: 0.003847,
+    32: 0.003847, 33: 0.012880, 34: 0.006747, 35: 0.037887, 36: 0.008246,
+    37: 0.020941, 38: 0.020941, 39: 0.008246, 40: 0.005279, 41: 0.005279,
+    42: 0.005279, 43: 0.005279, 44: 0.011315, 45: 0.005279, 46: 0.012880,
+    47: 0.005279, 48: 0.006747, 49: 0.005279, 50: 0.016062, 51: 0.008246,
+    52: 0.005279, 53: 0.006747, 54: 0.005279, 55: 0.005279,
+}
 TREND_HALF_LIFE_H = 24.0
 TREND_CHANGE_CAP = 2.5
 PLATINUM_MEDIAN_CAP = 3.0
@@ -296,6 +331,26 @@ def forecast_case(case, name):
         change = max(-TREND_CHANGE_CAP, min(TREND_CHANGE_CAP, change))
         trend[i] = (lg_last + change, resid, lev, lg_last, slope)
 
+    # ---- Stale-branch aggregates (only used when the page never moved). ----
+    # The v2 aggregate for the non-pinned trophies' earner growth up to the
+    # target, from the t_star decomposition above: the non-pinned earners
+    # the case already has, grown by the stale elasticity, minus what it
+    # already has. That total is distributed across trophies by the
+    # live-page pattern weights (STALE_WEIGHTS) instead of uniformly, so
+    # the sum of the stale medians still matches the v2 aggregate while
+    # the per-trophy split follows the fresh-player profile.
+    stale_growth = 0.0
+    stale_w = [0.0] * n
+    if stale:
+        stale_growth = max(0.0, (t_star - n_pinned * p_star)
+                           - max(0.0, t_last - n_pinned * p_last))
+        raw_w = [STALE_WEIGHTS.get(trophy["id"], 1.0 / 54.0)
+                 if j not in pinned_idx else 0.0
+                 for j, trophy in enumerate(trophies)]
+        w_sum = sum(raw_w)
+        if w_sum > 0:
+            stale_w = [w / w_sum for w in raw_w]
+
     # ---- Per-trophy medians and spreads. ----
     medians = []
     sigmas = []
@@ -333,15 +388,24 @@ def forecast_case(case, name):
         e_star = max(e_star, e_last)
         lg_earn = logit(100.0 * e_star / p_star) if p_star > 0 else lg_last
 
+        sigma_floor = SIGMA_MIN
         if r_last >= 99.99:
             # Universal trophy: every tracked player holds it; it stays pinned.
             lg_med = logit(99.99)
             sigma = SIGMA_MIN
         elif stale:
-            lg_med = lg_earn
-            sigma = max(SIGMA_STALE,
+            # Pattern-weighted median: this trophy's share of the aggregate
+            # non-pinned earner growth (stale_growth, the v2 total), by its
+            # live-page weight, on top of the earners it already had --
+            # instead of the uniform 0.13 elasticity, which credited every
+            # trophy with the same growth and missed the refresh's shape.
+            e_star = e_last + stale_w[i] * stale_growth
+            e_star = min(max(e_star, e_last), p_star)
+            lg_med = logit(100.0 * e_star / p_star) if p_star > 0 else lg_last
+            sigma = max(SIGMA_STALE_FLOOR,
                         math.sqrt((SIGMA_RW * math.sqrt(max(horizon_days, 0.0))) ** 2
                                   + SIGMA_FLOOR ** 2))
+            sigma_floor = SIGMA_STALE_FLOOR
         else:
             lg_med = (W_TREND * lg_tr + W_EARNERS * lg_earn
                       + W_PERSIST * lg_last)
@@ -361,7 +425,10 @@ def forecast_case(case, name):
         if (trophy.get("tier") == "platinum"
                 and lg_med > logit(PLATINUM_MEDIAN_CAP)):
             lg_med = logit(PLATINUM_MEDIAN_CAP)
-        sigma = max(SIGMA_MIN, min(SIGMA_MAX, sigma))
+        # The stale floor is ~0.35, not SIGMA_MIN: the final clamp must not
+        # raise a stale case's sigma back to 0.85. Every other case keeps
+        # the 0.85 floor.
+        sigma = max(sigma_floor, min(SIGMA_MAX, sigma))
         medians.append(lg_med)
         sigmas.append(sigma)
 
